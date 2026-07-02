@@ -1,0 +1,269 @@
+============================================================
+CONFIG CHANGES -- pMarineViewer click-to-redirect feature
+(controlled-team model, multi-team + per-boat untag-allow)
+For Aquaticus CTF or HVT missions.
+============================================================
+Operating model (matches current pRedirectWaypoint code):
+  DEPLOY (existing) -> boats deployed.
+  b / r             -> select the CLICK-TARGET team. Selection
+                       alone does NOT change control; it only
+                       chooses which roster the 1/2/3 keys and
+                       clicks apply to. Resets the boat index.
+  w                 -> toggle CONTROL for the selected team
+                       (also an on-screen button). Controlled ==
+                       held + clickable: the team station-holds
+                       and stops playing; releasing it returns
+                       the team to autonomy. BOTH teams can be
+                       controlled at once -- press b, w, r, w.
+  1 / 2 / 3         -> choose which boat on the click-target
+                       team the next click commands (1-based
+                       roster position).
+  left-click        -> send the selected boat to the clicked
+                       point; on arrival it holds station there.
+                       Ignored (with an appcast NOTE) if the
+                       selected team is not controlled.
+  u (untag toggle)  -> per-boat: allow/disallow the SELECTED
+                       boat to auto-return home to untag while
+                       controlled. Default OFF for every boat
+                       (HVT "tagged = dead"); ON gives CTF-style
+                       recovery. Reset when the team is released.
+  arrival heading   -> EXPERIMENTAL / NOT FULLY TESTED. Intended:
+                       after a redirect completes, the boat can be
+                       pointed on a commanded heading while holding
+                       (constant_heading_redirect, gated on
+                       REDIR_ARRIVED; heading would arrive via
+                       REDIR_HEADING updates -- no publisher yet).
+                       See section 8.
+
+On-screen feedback:
+  - Magenta VIEW_CIRCLE halo around every boat on a controlled
+    team, redrawn each tick at its live position (needs
+    NODE_REPORTs on the shoreside MOOSDB, which uFldNodeComms /
+    the standard shoreside stack already provides). The selected
+    boat's halo is filled; others are outline-only. Tagged boats
+    lose the halo. Halos clear when the team is released.
+  - RDR_CLICK_MODE latch: true whenever ANY team is controlled.
+    Scope it in pMarineViewer for an at-a-glance readout.
+
+Apply the edits below. Dates/rationale included for the journal.
+
+------------------------------------------------------------
+1) meta_surveyor.bhv -- initialize the gating flags
+------------------------------------------------------------
+Add next to the other initialize lines at the top:
+
+  initialize REDIR_CONTROLLED  = false  // click-to-redirect: boat under operator control
+  initialize REDIR_ACTIVE      = false  // click-to-redirect: active click-waypoint
+  initialize REDIR_ALLOW_UNTAG = false  // click-to-redirect: per-boat auto-untag permission
+  initialize REDIR_ARRIVED     = false  // click-to-redirect: last redirect completed
+
+Then paste the THREE behaviors into the #include common.bhv
+<bhvs> section (as done in meta_surveyor.bhv):
+
+  station_hold              BHV_StationKeep, pwt 140,
+                            center_activate=true ("hold where you
+                            are"; re-activation after a redirect
+                            captures the arrival point for free).
+                            Conditions: REDIR_CONTROLLED = true,
+                            REDIR_ACTIVE != true, TAGGED != true.
+  waypt_redirect            BHV_Waypoint, pwt 150, perpetual,
+                            updates=REDIR_UPDATE. Endflags clear
+                            REDIR_ACTIVE and set REDIR_ARRIVED /
+                            REDIR_WPT_REACHED.
+  constant_heading_redirect BHV_ConstantHeading, pwt 100,
+                            perpetual, updates=REDIR_HEADING.
+                            EXPERIMENTAL -- not fully implemented
+                            or tested (see section 8). Intended to
+                            point the boat on a commanded heading
+                            after arrival. Conditions:
+                            REDIR_CONTROLLED = true,
+                            REDIR_ARRIVED = true, TAGGED != true.
+                            Safe to comment out until finished.
+
+Priority-weight contract, noted for the journal:
+  waypt_redirect (150) > station_hold (140) > game bhvs (<=100).
+On arrival waypt_redirect clears REDIR_ACTIVE and station_hold
+resumes AT the clicked point; constant_heading_redirect then
+shapes the heading while station_hold holds position.
+
+(No nsplug macros are used in those behaviors, so the block is
+identical for every boat -- no launch_surveyor.sh change.)
+
+------------------------------------------------------------
+2) meta_surveyor.bhv -- gate the GAME behaviors off when controlled
+------------------------------------------------------------
+So a controlled boat holds instead of playing, add this one
+condition line to each game behavior (helm conditions on separate
+lines are ANDed):
+
+  condition = REDIR_CONTROLLED != true
+
+Add it to: waypt_grab_easy, waypt_grab_medium, loiter_passive,
+aggressive_station_keep, and rlagent_attacker.
+
+waypt_untag is gated DIFFERENTLY: a controlled boat may only
+auto-recover home to untag if the operator has flipped its
+per-boat untag-allow on. Give waypt_untag:
+
+  condition = (REDIR_CONTROLLED != true) or (REDIR_ALLOW_UNTAG = true)
+
+Do NOT gate the avdcollision_ behavior (reactive safety stays
+active regardless of control state). NOTE: avdcollision_ is
+currently commented out entirely in meta_surveyor.bhv; if it is
+re-enabled, leave it ungated. (Also: cutrange_aggressive_ around
+line 182 has its "Behavior =" line commented but its { } block
+left live -- comment the block out fully to avoid an orphan
+block in the helm parse.)
+
+Rationale: REDIR_CONTROLLED is the single gate that both (a)
+activates station_hold and (b) suppresses game play, so a
+controlled boat does exactly one thing -- hold -- until clicked.
+REDIR_ALLOW_UNTAG is the per-boat escape hatch: default-off
+gives the HVT "tagged = dead" semantics; the operator can toggle
+it on per boat for CTF-style recovery.
+
+------------------------------------------------------------
+3) meta_shoreside.moos -- ANTLER: launch the dispatcher
+------------------------------------------------------------
+In ProcessConfig = ANTLER add:
+
+  Run = pRedirectWaypoint @ NewConsole = false
+
+------------------------------------------------------------
+4) meta_shoreside.moos -- uFldShoreBroker: qbridge the cmd vars
+------------------------------------------------------------
+In ProcessConfig = uFldShoreBroker add:
+
+  // Click-to-redirect (pMarineViewer feature). pRedirectWaypoint
+  // posts the *_<VNAME> forms on shore; these qbridges relay them
+  // to each vehicle as bare REDIR_CONTROLLED / REDIR_ACTIVE /
+  // REDIR_UPDATE / REDIR_ALLOW_UNTAG for the station_hold +
+  // waypt_redirect + waypt_untag behaviors.
+  qbridge = REDIR_CONTROLLED
+  qbridge = REDIR_ACTIVE
+  qbridge = REDIR_UPDATE
+  qbridge = REDIR_ALLOW_UNTAG
+
+  // EXPERIMENTAL arrival-heading feature only (section 8; not
+  // fully implemented or tested). The vehicle sets REDIR_ARRIVED
+  // locally (waypt_redirect endflag); shore needs these bridges
+  // to (a) CLEAR REDIR_ARRIVED on a new click / on release and
+  // (b) eventually command the post-arrival heading.
+  qbridge = REDIR_ARRIVED
+  qbridge = REDIR_HEADING
+
+------------------------------------------------------------
+5) meta_shoreside.moos -- pMarineViewer: click poke + buttons
+------------------------------------------------------------
+In ProcessConfig = pMarineViewer:
+
+  // Click-to-redirect: post the clicked position to the dispatcher.
+  // any_left (no [key]) => fires on every plain left-click.
+  // $(XPOS)/$(YPOS) expand to local-grid meters (documented macro
+  // spelling; the viewer also accepts $[XPOS]).
+  left_context = RDR_CLICK = x=$(XPOS),y=$(YPOS)
+
+  // On-screen toggle mirroring the 'w' key: toggles CONTROL for
+  // the currently selected team. Posts a changing value;
+  // pRedirectWaypoint owns the per-team control latch.
+  button_13 = WCtrlTeam # RDR_CLICK_MODE_TOGGLE=$[UTC]
+
+  // On-screen per-boat untag-allow toggle for the SELECTED boat.
+  // Posts a changing value; pRedirectWaypoint owns the per-boat
+  // state and pokes REDIR_ALLOW_UNTAG_<VNAME>.
+  button_14 = UntagAllow # RDR_UNTAG_TOGGLE=$[UTC]
+
+  // Scope the live latch on-screen: true iff ANY team is
+  // currently controlled.
+  scope = RDR_CLICK_MODE
+
+(Use any free button_N; button_13/14 chosen to avoid your
+existing button_1..button_12. Rename labels as you like.)
+
+NOTE on the 'w' key: a bare left-click with SHIFT or ALT held is
+pMarineViewer's drop-point gesture (built in). Plain left-clicks
+are free in your config, so RDR_CLICK via any_left does not
+collide. The 'w' key is unused by stock pMarineViewer. The
+b/r/1..9 selection keys come from the patched pMarineViewer
+(RDR_SEL_TEAM / RDR_SEL_INDEX / RDR_CLICK_MODE_TOGGLE posts).
+
+------------------------------------------------------------
+6) pRedirectWaypoint ProcessConfig block (meta_shoreside.moos)
+------------------------------------------------------------
+  ProcessConfig = pRedirectWaypoint
+  {
+    AppTick   = 4
+    CommsTick = 4
+
+    // Ordered rosters. List position == selection index (1-based):
+    //   1 -> *_one, 2 -> *_two, 3 -> *_three
+    team_blue = blue_one, blue_two, blue_three
+    team_red  = red_one,  red_two,  red_three
+
+    // Waypoint tuning, applied to every dispatched click-waypoint:
+    capture_radius = 10.0
+    slip_radius    = 15.0
+    speed          = 2.0
+
+    // Radius (m) of the magenta control halo drawn around each
+    // controlled boat:
+    control_circle_radius = 10.0
+
+    // Variable name overrides (defaults shown):
+    // click_var        = RDR_CLICK
+    // sel_team_var     = RDR_SEL_TEAM
+    // sel_index_var    = RDR_SEL_INDEX
+    // mode_toggle_var  = RDR_CLICK_MODE_TOGGLE
+    // mode_state_var   = RDR_CLICK_MODE
+    // untag_toggle_var = RDR_UNTAG_TOGGLE
+    // untag_var        = REDIR_ALLOW_UNTAG
+    // arrived_var      = REDIR_ARRIVED
+    // controlled_var   = REDIR_CONTROLLED
+    // active_var       = REDIR_ACTIVE
+    // update_var       = REDIR_UPDATE
+
+    debug = true
+  }
+
+The dispatcher also subscribes to NODE_REPORT / NODE_REPORT_* (to
+draw the control halos at live positions) and TAGGED_VEHICLES /
+TAGGED_<VNAME> (tagged boats lose their halo and their untag-allow
+resets on team release). No extra config needed -- these already
+exist on the shoreside MOOSDB in the standard Aquaticus/HVT stack.
+
+------------------------------------------------------------
+8) Arrival-heading feature -- EXPERIMENTAL / NOT FULLY TESTED
+------------------------------------------------------------
+STATUS: partially implemented; do not rely on it in a live
+mission until finished and tested. If it causes trouble, comment
+out constant_heading_redirect in meta_surveyor.bhv -- the core
+click-to-redirect workflow does not depend on it.
+
+meta_surveyor.bhv carries constant_heading_redirect, gated on
+REDIR_ARRIVED with heading via updates=REDIR_HEADING.
+
+  a) REDIR_ARRIVED lifecycle -- HANDLED by pRedirectWaypoint
+     (implemented, needs live-mission testing). waypt_redirect
+     sets it true on arrival (endflag); the dispatcher clears
+     REDIR_ARRIVED_<VNAME>:
+       - on every new click (dispatchWaypoint), so the heading
+         behavior deactivates during transit;
+       - on team release (recomputeControl);
+       - on a team becoming newly controlled (stale-state guard).
+     Requires qbridge = REDIR_ARRIVED (section 4).
+
+  b) NOT IMPLEMENTED: nothing publishes REDIR_HEADING. Until the
+     dispatcher (or another shoreside app) posts
+     REDIR_HEADING_<VNAME>, the behavior activates on arrival
+     with whatever default heading BHV_ConstantHeading has.
+     Either add a heading command to the dispatcher (e.g. a
+     second click or key sets the pointing heading) or leave the
+     behavior commented out until the publisher exists.
+
+------------------------------------------------------------
+9) Roster source (optional, vs. hardcoding in #6)
+------------------------------------------------------------
+For a fixed 3v3 sim, hardcoding team_blue/team_red in #6 is fine.
+If you want them to follow --vnames automatically, split $(VNAMES)
+(colon-separated) into red/blue CSVs in launch_shoreside.sh and
+pass them as nsplug vars. See implementation_notes.md.
