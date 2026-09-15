@@ -61,6 +61,20 @@ class RedirectWaypoint : public AppCastingMOOSApp
   void   handleUntagToggle();
   bool   handleClick(std::string click_str);
   void   recomputeControl();
+  // Wake exactly the selected boat of a controlled team (drop its
+  // manual override) and re-park every boat this app previously woke.
+  // Never touches boats we did not wake, so autonomously-deployed
+  // vehicles are left alone.
+  void   reconcileWake();
+  void   setOverride(const std::string& vname, bool override_on);
+  // Erase a boat's station_hold keep-in/out/hiber polygons from the
+  // viewer. Needed on release: forcing manual override parks the helm
+  // before BHV_StationKeep can clear its own visuals, so they linger.
+  void   clearStationKeepViz(const std::string& vname);
+  // True if the game is deployed for this boat (DEPLOY pressed). On
+  // release, woken boats are restored to override=!isDeployed(): parked
+  // if never deployed, autonomous if deployed.
+  bool   isDeployed(const std::string& vname) const;
   void   dispatchWaypoint(double x, double y);
   void   handleMailNodeReport(std::string report);
   void   handleMailTaggedVehicles(std::string csv);
@@ -120,6 +134,17 @@ class RedirectWaypoint : public AppCastingMOOSApp
   // Boats (by vname) currently allowed to auto-untag while
   // controlled. Per-boat, keyed to the b/r/123 selection.
   std::set<std::string> m_untag_allowed;
+
+  // Boats this app has woken (posted MOOS_MANUAL_OVERRIDE=false).
+  // Only these are re-parked on release/reselect, so a boat driving
+  // itself under autonomy is never frozen by us. See reconcileWake().
+  std::set<std::string> m_awake;
+
+  // Deploy state, so release can restore a boat to its pre-control
+  // condition. m_deploy_all tracks DEPLOY_ALL (the viewer Deploy/Pause
+  // buttons); m_deploy_vehicle holds any per-vehicle DEPLOY_<V> override.
+  bool m_deploy_all;
+  std::map<std::string, bool> m_deploy_vehicle;
 
   // Appcast bookkeeping
   unsigned int m_clicks_received;

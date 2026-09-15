@@ -2,7 +2,7 @@
 
 A shoreside MOOS-IvP dispatcher app implementing a **click-to-redirect** workflow in pMarineViewer for Aquaticus capture-the-flag (CTF) and high-value-target (HVT) missions.
 
-The operator selects a team and a boat, then left-clicks anywhere on the map to send that boat to the clicked point. On arrival, the boat station-holds at the clicked position until redirected again or released back to autonomy. Boats on a *controlled* team hold position and stop playing the game; the other team continues playing autonomously.
+The operator selects a team and a boat, then left-clicks anywhere on the map to send that boat to the clicked point. On arrival, the boat station-holds at the clicked position until redirected again or the team is released. Only boats you actually engage (select) are driven — their manual override is dropped and they **stay under power until the team is released**, so a boat finishes its waypoint and holds at the destination even after you select off it. The rest of a controlled team, and the other team, are untouched.
 
 `pRedirectWaypoint` is a thin dispatcher: it performs **no geodesy and owns no behavior logic**. It only maps operator intent (team/boat selection + map clicks) onto per-vehicle command variables (`REDIR_CONTROLLED_<VNAME>`, `REDIR_ACTIVE_<VNAME>`, `REDIR_UPDATE_<VNAME>`) that `uFldShoreBroker` qbridges down to each vehicle, where the `station_hold` and `waypt_redirect` behaviors act on them.
 
@@ -14,7 +14,7 @@ The operator selects a team and a boat, then left-clicks anywhere on the map to 
 |---|---|
 | `DEPLOY` (existing) | Boats deployed as usual. |
 | `b` / `r` | Select the **click-target team** (blue/red). Resets the boat index. Selection alone does *not* change control. |
-| `w` (key or on-screen button) | Toggle **control** for the currently selected team. A controlled team station-holds and becomes clickable; releasing it returns the team to autonomy. Multiple teams can be controlled at once. |
+| `w` (key or on-screen button) | Toggle **control** for the currently selected team. A controlled team becomes clickable; boats you select on it come under power and stay driving until release. Releasing returns each engaged boat to its pre-control state (parked if not deployed, autonomous if deployed). Multiple teams can be controlled at once. |
 | `1` / `2` / `3` ... | Select which boat on the click-target team the next click commands (1-based roster index). |
 | left-click | Send the selected boat to the clicked point (`REDIR_ACTIVE` + `REDIR_UPDATE`). On arrival the boat reverts to station-hold *at the clicked point*. |
 | `u` (or on-screen button, `RDR_UNTAG_TOGGLE`) | Per-boat: allow/disallow the selected boat to auto-return home to untag while controlled. Default OFF (HVT "tagged = dead"); ON gives CTF-style recovery. |
@@ -25,6 +25,8 @@ Notes on the control model:
 - Pressing `w` on a newly controlled team clears any stale click-waypoint so boats hold at their *current* position rather than resuming an old redirect.
 - Switching the click target between two already-controlled teams does not release either team or cancel an in-flight waypoint.
 - Releasing a team clears its click-waypoints, arrival latches, and untag-allow flags.
+- **Only engaged boats are woken, and they stay awake until release.** Taking control of a team no longer drops manual override on every boat of that team (which made the whole team go live as if `DEPLOY` had been pressed). A boat's override is dropped when you **select** it on a controlled team; it then holds position, and on a click drives to the point and station-holds there. Selecting off it (or onto another boat) does **not** park it — it keeps its waypoint and finishes. Boats you never select stay parked.
+- **Release restores the pre-control state.** Pressing `w` to release a team returns each boat this app woke to how it was before you took it: **parked** (`MOOS_MANUAL_OVERRIDE=true`) if `DEPLOY` was never pressed, or **running its autonomous behaviors** (override off) if the game is deployed. The dispatcher tracks `DEPLOY_ALL` to decide this. Boats it never woke are never overridden, so an autonomously-deployed vehicle is never frozen. On release it also erases the boat's `station_hold` keep-in/out/hiber polygons — forcing manual override parks the helm before `BHV_StationKeep` can clear its own visuals, so the dispatcher removes them explicitly.
 - *(Experimental)* After a redirect completes, the vehicle-side `constant_heading_redirect` behavior is intended to point the boat on a commanded heading while `station_hold` keeps position. This feature is **not fully implemented or tested** — no heading publisher exists yet. The dispatcher already clears the `REDIR_ARRIVED` latch on every new click, release, and new control session so the behavior can never fight an in-transit waypoint with stale state.
 
 ## On-Screen Feedback

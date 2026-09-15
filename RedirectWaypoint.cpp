@@ -50,6 +50,8 @@ RedirectWaypoint::RedirectWaypoint()
   m_clicks_received = 0;
   m_waypoints_sent  = 0;
 
+  m_deploy_all = false;
+
   m_debug = false;
   m_debug_buffer_max = 20;
 }
@@ -84,6 +86,13 @@ bool RedirectWaypoint::OnNewMail(MOOSMSG_LIST &NewMail)
       handleUntagToggle();
     else if(key == m_click_var)
       handleClick(sval);
+    else if((key == "DEPLOY_ALL") || (key == "DEPLOY")) {
+      m_deploy_all = (tolower(sval) == "true");
+    }
+    else if(strBegins(key, "DEPLOY_")) {
+      string vname = tolower(key.substr(7));
+      m_deploy_vehicle[vname] = (tolower(sval) == "true");
+    }
     else if((key == "NODE_REPORT") || strBegins(key, "NODE_REPORT_"))
       handleMailNodeReport(sval);
     else if(key == "TAGGED_VEHICLES")
@@ -198,6 +207,17 @@ void RedirectWaypoint::registerVariables()
   Register("NODE_REPORT", 0);
   Register("NODE_REPORT_LOCAL", 0);
   Register("TAGGED_VEHICLES", 0);
+
+  // Deploy state -- so releasing a boat can restore it to how it was
+  // before we took it: parked if Deploy was never pressed, autonomous
+  // if it was. DEPLOY_ALL is what the viewer Deploy/Pause buttons post.
+  Register("DEPLOY_ALL", 0);
+  Register("DEPLOY", 0);
+  for(int t=0; t<2; t++) {
+    const std::vector<std::string>& roster = teamRoster((t==0)?"blue":"red");
+    for(unsigned int i=0; i<roster.size(); i++)
+      Register("DEPLOY_" + toupper(roster[i]), 0);
+  }
 }
 
 //---------------------------------------------------------
@@ -256,6 +276,93 @@ void RedirectWaypoint::handleSelectTeam(string team)
   bool held = (m_controlled_teams.count(team) > 0);
   debugLog("Click target: " + team +
            (held ? " (controlled)" : " (not controlled; press w to control)"));
+
+  // Selecting a team resets the boat index; wake whatever boat is now
+  // selected on a controlled team (none, until a number is pressed).
+  reconcileWake();
+}
+
+//---------------------------------------------------------
+// Procedure: setOverride()
+//   Post MOOS_MANUAL_OVERRIDE for one boat. Both the correct and the
+//   legacy one-R spelling are bridged by uFldShoreBroker, so post both
+//   so whichever pMarinePID/iM1_8 build is running obeys it.
+
+void RedirectWaypoint::setOverride(const string& vname, bool override_on)
+{
+  string up  = toupper(vname);
+  string val = override_on ? "true" : "false";
+  Notify("MOOS_MANUAL_OVERRIDE_" + up, val);
+  Notify("MOOS_MANUAL_OVERIDE_" + up, val);
+}
+
+//---------------------------------------------------------
+// Procedure: clearStationKeepViz()
+//   BHV_StationKeep draws three polygons per boat -- <vname>:station-
+//   keep-out / -in / -hiber. On release we force manual override, which
+//   parks the helm before the behavior can erase its own visuals, so the
+//   keep-out ring lingers on the map. Post each label inactive to remove
+//   it. Removal is by label, so a minimal spec at the boat's last known
+//   position is enough; geometry is ignored.
+
+void RedirectWaypoint::clearStationKeepViz(const string& vname)
+{
+  double x = 0, y = 0;
+  map<string, NodeRecord>::iterator p = m_node_records.find(tolower(vname));
+  if(p != m_node_records.end()) {
+    x = p->second.getX();
+    y = p->second.getY();
+  }
+  const char* suffix[3] = {"station-keep-out","station-keep-in","station-keep-hiber"};
+  for(int i=0; i<3; i++) {
+    string spec = "radial:: x=" + doubleToStringX(x,1) +
+                  ",y=" + doubleToStringX(y,1) +
+                  ",radius=1,pts=8,label=" + vname + ":" + suffix[i] +
+                  ",active=false";
+    Notify("VIEW_POLYGON", spec);
+  }
+  debugLog("Cleared station-keep visuals for " + vname);
+}
+
+//---------------------------------------------------------
+// Procedure: reconcileWake()
+//   Exactly one boat may be "awake" (manual override dropped): the
+//   selected boat of the click-target team, and only while that team
+//   is actually controlled. Every boat THIS APP previously woke and
+//   that is no longer that boat is re-parked (override restored).
+//
+//   Only boats in m_awake are ever re-parked, so a vehicle driving
+//   itself under autonomy -- one we never woke -- is never frozen here.
+
+void RedirectWaypoint::reconcileWake()
+{
+  // Wake the selected boat of the click-target team, if that team is
+  // controlled. A woken boat STAYS awake -- it finishes any click-
+  // waypoint and then station-holds at the destination -- even after
+  // you select off it. Boats are only ever re-parked when their team is
+  // released (see recomputeControl), never on reselect.
+  if(m_controlled_teams.count(m_controlled_team) == 0)
+    return;
+
+  string wake = selectedVName();
+  if((wake != "") && (m_awake.count(wake) == 0)) {
+    setOverride(wake, false);
+    m_awake.insert(wake);
+    debugLog("Woke selected boat " + wake + " (manual override dropped)");
+  }
+}
+
+//---------------------------------------------------------
+// Procedure: isDeployed()
+//   Per-vehicle DEPLOY_<V> if we have seen one, else the global
+//   DEPLOY_ALL state (what the viewer Deploy/Pause buttons drive).
+
+bool RedirectWaypoint::isDeployed(const string& vname) const
+{
+  map<string,bool>::const_iterator it = m_deploy_vehicle.find(tolower(vname));
+  if(it != m_deploy_vehicle.end())
+    return(it->second);
+  return(m_deploy_all);
 }
 
 //---------------------------------------------------------
@@ -273,6 +380,11 @@ void RedirectWaypoint::recomputeControl()
     for(unsigned int i=0; i<roster.size(); i++) {
       string up = toupper(roster[i]);
       Notify(m_controlled_var + "_" + up, hold ? "true" : "false");
+      // Manual override is deliberately NOT dropped for the whole team
+      // here. Doing so woke every boat on a controlled team (motors live)
+      // as if DEPLOY had been pressed, even though only one was selected.
+      // reconcileWake() below wakes a boat only when it is selected; a
+      // woken boat then stays awake until its team is released.
       if(!hold) {
         // Releasing this boat to autonomy: clear any click-waypoint,
         // its arrival latch, and reset its untag-allow. Boats that
@@ -282,9 +394,26 @@ void RedirectWaypoint::recomputeControl()
         Notify(m_arrived_var + "_" + up, "false");
         Notify(m_untag_var + "_" + up, "false");
         m_untag_allowed.erase(roster[i]);
+        // Restore a boat we woke to its pre-control state: parked
+        // (override on) if the game was never deployed, or driving its
+        // autonomous behaviors (override off) if Deploy has been pressed.
+        // Boats we never woke are left untouched, so an autonomously
+        // deployed vehicle is never frozen by us.
+        if(m_awake.count(roster[i])) {
+          setOverride(roster[i], !isDeployed(roster[i]));
+          clearStationKeepViz(roster[i]);
+          m_awake.erase(roster[i]);
+          debugLog("Released " + roster[i] + " -> " +
+                   (isDeployed(roster[i]) ? "autonomy (override off)"
+                                          : "parked (override on)"));
+        }
       }
     }
   }
+
+  // Wake the selected controlled boat (if any). Boats stay awake until
+  // their team is released, which is handled in the !hold branch above.
+  reconcileWake();
 }
 
 //---------------------------------------------------------
@@ -441,6 +570,8 @@ void RedirectWaypoint::handleSelectIndex(string idx_str)
   if(idx >= 1) {
     m_sel_index = (unsigned int)idx;
     debugLog("Index selected: " + uintToString(m_sel_index));
+    // Wake the newly selected boat when its team is controlled.
+    reconcileWake();
   }
   else {
     m_last_warning = "Bad index value: " + idx_str;
