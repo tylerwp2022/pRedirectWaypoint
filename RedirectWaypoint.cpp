@@ -7,6 +7,7 @@
 
 #include <iterator>
 #include <cstdlib>
+#include <cmath>
 #include "MBUtils.h"
 #include "NodeRecordUtils.h"
 #include "ACTable.h"
@@ -37,6 +38,9 @@ RedirectWaypoint::RedirectWaypoint()
   m_controlled_var  = "REDIR_CONTROLLED";
   m_untag_var       = "REDIR_ALLOW_UNTAG";
   m_arrived_var     = "REDIR_ARRIVED";
+  m_heading_click_var = "RDR_CLICK_HDG";
+  m_heading_var     = "REDIR_HEADING";
+  m_turn_var        = "REDIR_TURN";
 
   m_capture_radius = 10.0;
   m_slip_radius    = 15.0;
@@ -46,6 +50,12 @@ RedirectWaypoint::RedirectWaypoint()
   m_controlled_team = "";
   m_sel_index       = 0;
   m_click_mode      = false;
+
+  m_awaiting_heading = false;
+  m_pending_x        = 0;
+  m_pending_y        = 0;
+  m_pending_vname    = "";
+  m_last_heading     = "";
 
   m_clicks_received = 0;
   m_waypoints_sent  = 0;
@@ -86,6 +96,8 @@ bool RedirectWaypoint::OnNewMail(MOOSMSG_LIST &NewMail)
       handleUntagToggle();
     else if(key == m_click_var)
       handleClick(sval);
+    else if(key == m_heading_click_var)
+      handleHeadingClick(sval);
     else if((key == "DEPLOY_ALL") || (key == "DEPLOY")) {
       m_deploy_all = (tolower(sval) == "true");
     }
@@ -150,6 +162,12 @@ bool RedirectWaypoint::OnStartUp()
       handled = handleConfigTeamVehicles("red", value);
     else if(param == "click_var") {
       m_click_var = value; handled = true; }
+    else if(param == "heading_click_var") {
+      m_heading_click_var = value; handled = true; }
+    else if(param == "heading_var") {
+      m_heading_var = value; handled = true; }
+    else if(param == "turn_var") {
+      m_turn_var = value; handled = true; }
     else if(param == "sel_team_var") {
       m_sel_team_var = value; handled = true; }
     else if(param == "sel_index_var") {
@@ -204,6 +222,7 @@ void RedirectWaypoint::registerVariables()
   Register(m_mode_toggle_var, 0);
   Register(m_untag_toggle_var, 0);
   Register(m_click_var, 0);
+  Register(m_heading_click_var, 0);
   Register("NODE_REPORT", 0);
   Register("NODE_REPORT_LOCAL", 0);
   Register("TAGGED_VEHICLES", 0);
@@ -680,9 +699,41 @@ bool RedirectWaypoint::handleClick(string click_str)
 {
   m_clicks_received++;
 
-  // A click acts only if the SELECTED team is currently controlled
-  // (controlled == clickable). If no team selected or the selected
-  // team is in autonomy, ignore the click.
+  string xstr = tokStringParse(click_str, "x", ',', '=');
+  string ystr = tokStringParse(click_str, "y", ',', '=');
+  if((xstr == "") || (ystr == "")) {
+    m_last_warning = "Malformed click: " + click_str;
+    debugLog(m_last_warning);
+    return(false);
+  }
+  double x = atof(xstr.c_str());
+  double y = atof(ystr.c_str());
+
+  // Heading-completion click: a prior right-click (handleHeadingClick)
+  // armed a pending waypoint. This left-click sets the target heading =
+  // compass direction from that waypoint to here, and dispatches with
+  // an on-arrival turn-in-place. The boat was captured at arm time.
+  if(m_awaiting_heading) {
+    double dx = x - m_pending_x;
+    double dy = y - m_pending_y;
+    double heading = 0;
+    if((dx != 0) || (dy != 0)) {
+      heading = atan2(dx, dy) * 180.0 / M_PI;   // compass: 0=N, 90=E
+      if(heading < 0)
+        heading += 360.0;
+    }
+    string vname = m_pending_vname;
+    clearPendingMarker(vname);
+    postHeadingArrow(vname, m_pending_x, m_pending_y, heading);
+    dispatchWaypoint(vname, m_pending_x, m_pending_y, true, heading);
+    m_awaiting_heading = false;
+    m_last_heading = doubleToStringX(heading,1) + " deg (" + vname + ")";
+    return(true);
+  }
+
+  // Plain click: acts only if the SELECTED team is currently controlled
+  // (controlled == clickable). If no team selected or the selected team
+  // is in autonomy, ignore the click.
   if(m_controlled_team == "") {
     m_last_warning = "Click ignored -- no team selected (press b or r)";
     debugLog(m_last_warning);
@@ -691,14 +742,6 @@ bool RedirectWaypoint::handleClick(string click_str)
   if(m_controlled_teams.count(m_controlled_team) == 0) {
     m_last_warning = "Click ignored -- " + m_controlled_team +
                      " not controlled (press w to control it)";
-    debugLog(m_last_warning);
-    return(false);
-  }
-
-  string xstr = tokStringParse(click_str, "x", ',', '=');
-  string ystr = tokStringParse(click_str, "y", ',', '=');
-  if((xstr == "") || (ystr == "")) {
-    m_last_warning = "Malformed click: " + click_str;
     debugLog(m_last_warning);
     return(false);
   }
@@ -712,23 +755,69 @@ bool RedirectWaypoint::handleClick(string click_str)
     return(false);
   }
 
-  double x = atof(xstr.c_str());
-  double y = atof(ystr.c_str());
-  dispatchWaypoint(x, y);
+  dispatchWaypoint(vname, x, y, false, 0);
+  return(true);
+}
+
+//---------------------------------------------------------
+// Procedure: handleHeadingClick()
+//   Right-click (RDR_CLICK_HDG): arm the heading gesture. Drops a
+//   pending waypoint at the clicked point and remembers the selected
+//   boat; the operator's NEXT left-click sets the heading. Requires the
+//   same control/selection state as a normal click. No dispatch yet.
+
+bool RedirectWaypoint::handleHeadingClick(string click_str)
+{
+  if(m_controlled_team == "") {
+    m_last_warning = "Heading click ignored -- no team selected (press b or r)";
+    debugLog(m_last_warning);
+    return(false);
+  }
+  if(m_controlled_teams.count(m_controlled_team) == 0) {
+    m_last_warning = "Heading click ignored -- " + m_controlled_team +
+                     " not controlled (press w to control it)";
+    debugLog(m_last_warning);
+    return(false);
+  }
+  string vname = selectedVName();
+  if(vname == "") {
+    m_last_warning = "Heading click ignored -- no valid boat selected";
+    debugLog(m_last_warning);
+    return(false);
+  }
+
+  string xstr = tokStringParse(click_str, "x", ',', '=');
+  string ystr = tokStringParse(click_str, "y", ',', '=');
+  if((xstr == "") || (ystr == "")) {
+    m_last_warning = "Malformed heading click: " + click_str;
+    debugLog(m_last_warning);
+    return(false);
+  }
+
+  m_pending_x        = atof(xstr.c_str());
+  m_pending_y        = atof(ystr.c_str());
+  m_pending_vname    = vname;
+  m_awaiting_heading = true;
+  postPendingMarker(vname, m_pending_x, m_pending_y);
+  m_last_warning = "Heading armed for " + vname +
+                   " -- left-click to set heading direction";
+  debugLog(m_last_warning);
   return(true);
 }
 
 //---------------------------------------------------------
 // Procedure: dispatchWaypoint()
-//   Poke the per-vehicle command vars for the selected boat.
-//   REDIR_ACTIVE activates waypt_redirect (pwt 150) which
-//   outbids station_hold (pwt 140); on arrival the behavior
-//   clears REDIR_ACTIVE and station_hold resumes, holding the
-//   boat at the clicked point.
+//   Poke the per-vehicle command vars for the given boat.
+//   REDIR_ACTIVE activates waypt_redirect (pwt 150) which outbids
+//   station_hold (pwt 140); on arrival the behavior clears REDIR_ACTIVE
+//   and station_hold resumes, holding the boat at the clicked point.
+//   When turn==true, also publishes the numeric target heading
+//   (REDIR_HEADING) and arms the on-arrival turn-in-place (REDIR_TURN);
+//   BHV_TurnInPlace on the vehicle fires once REDIR_ARRIVED goes true.
 
-void RedirectWaypoint::dispatchWaypoint(double x, double y)
+void RedirectWaypoint::dispatchWaypoint(const string& vname, double x,
+                                        double y, bool turn, double heading)
 {
-  string vname = selectedVName();
   if(vname == "")
     return;
   string up = toupper(vname);
@@ -740,19 +829,76 @@ void RedirectWaypoint::dispatchWaypoint(double x, double y)
   update += "#speed="          + doubleToStringX(m_speed,1);
 
   Notify(m_update_var + "_" + up, update);
-  // Clear the arrival latch BEFORE re-activating: REDIR_ARRIVED is
-  // set true on the vehicle by the waypt_redirect endflag and gates
-  // constant_heading_redirect. Without this clear, that behavior
-  // stays active through the new transit and bids a stale heading
-  // (pwt 100) against waypt_redirect (pwt 150).
+  // Clear the arrival latch BEFORE re-activating: REDIR_ARRIVED is set
+  // true on the vehicle by the waypt_redirect endflag and gates the
+  // on-arrival turn-in-place. Without this clear, a stale ARRIVED would
+  // fire the turn immediately at the start of the new transit.
   Notify(m_arrived_var + "_" + up, "false");
+
+  // Heading path: publish the numeric target heading and arm the
+  // on-arrival turn-in-place. Plain path: clear the turn flag so the
+  // boat just holds at the clicked point (no turn).
+  if(turn) {
+    Notify(m_heading_var + "_" + up, heading);   // numeric (double)
+    Notify(m_turn_var + "_" + up, "true");
+  }
+  else
+    Notify(m_turn_var + "_" + up, "false");
+
   Notify(m_active_var + "_" + up, "true");
 
   m_waypoints_sent++;
   m_last_target  = vname;
   m_last_point   = "x=" + doubleToStringX(x,1) + ", y=" + doubleToStringX(y,1);
+  if(turn)
+    m_last_point += ", hdg=" + doubleToStringX(heading,1);
   m_last_warning = "";
-  debugLog("Sent waypoint to " + vname + " (" + m_last_point + ")");
+  debugLog("Sent waypoint to " + vname + " (" + m_last_point + ")" +
+           (turn ? " +turn-in-place" : ""));
+}
+
+//---------------------------------------------------------
+// Procedure: postPendingMarker() / clearPendingMarker()
+//   A yellow point at the pending waypoint while awaiting the heading
+//   click, keyed per-vehicle so it updates/clears in place.
+
+void RedirectWaypoint::postPendingMarker(const string& vname, double x, double y)
+{
+  string spec;
+  spec += "x=" + doubleToStringX(x,2);
+  spec += ",y=" + doubleToStringX(y,2);
+  spec += ",vertex_size=6,vertex_color=yellow";
+  spec += ",active=true";
+  spec += ",label=" + vname + "_pendwpt";
+  Notify("VIEW_POINT", spec);
+}
+
+void RedirectWaypoint::clearPendingMarker(const string& vname)
+{
+  string spec;
+  spec += "x=0,y=0,active=false";
+  spec += ",label=" + vname + "_pendwpt";
+  Notify("VIEW_POINT", spec);
+}
+
+//---------------------------------------------------------
+// Procedure: postHeadingArrow()
+//   A short yellow segment from the waypoint pointing along the chosen
+//   compass heading, as operator feedback. Fades after a few seconds.
+
+void RedirectWaypoint::postHeadingArrow(const string& vname, double x,
+                                        double y, double heading)
+{
+  double len = 15.0;
+  double hx = x + len * sin(heading * M_PI / 180.0);   // east component
+  double hy = y + len * cos(heading * M_PI / 180.0);   // north component
+  string spec;
+  spec += "pts={" + doubleToStringX(x,2) + "," + doubleToStringX(y,2);
+  spec += ":"     + doubleToStringX(hx,2) + "," + doubleToStringX(hy,2) + "}";
+  spec += ",edge_color=yellow,edge_size=2,vertex_size=0";
+  spec += ",label=" + vname + "_hdgarrow";
+  spec += ",duration=10";
+  Notify("VIEW_SEGLIST", spec);
 }
 
 //---------------------------------------------------------
@@ -817,6 +963,14 @@ bool RedirectWaypoint::buildReport()
   m_msgs << "  Waypoints sent:  " << m_waypoints_sent             << endl;
   m_msgs << "  Last target:     " << m_last_target                << endl;
   m_msgs << "  Last point:      " << m_last_point                 << endl;
+  m_msgs << "  Heading gesture: "
+         << (m_awaiting_heading
+               ? ("ARMED for " + m_pending_vname +
+                  " @ (" + doubleToStringX(m_pending_x,1) + ", " +
+                  doubleToStringX(m_pending_y,1) + ") -- left-click to set")
+               : "idle (right-click a boat's target to arm)")        << endl;
+  m_msgs << "  Last heading:    "
+         << (m_last_heading == "" ? "(none)" : m_last_heading)     << endl;
   if(m_last_warning != "")
     m_msgs << "  NOTE:            " << m_last_warning             << endl;
 
