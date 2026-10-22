@@ -10,6 +10,12 @@ The operator selects a team and a boat, then left-clicks anywhere on the map to 
 
 ## Operating Model
 
+The keys below are `hotkey` lines in the mission's pMarineViewer block
+(the fork's viewer binds nothing by itself):
+`hotkey = b # RDR_SEL_TEAM=blue`, `hotkey = r # RDR_SEL_TEAM=red`,
+`hotkey = 1-9 # RDR_SEL_INDEX=$[KEY]`, `hotkey = w # RDR_CLICK_MODE_TOGGLE`,
+`hotkey = u # RDR_UNTAG_TOGGLE`.
+
 | Input | Action |
 |---|---|
 | `DEPLOY` (existing) | Boats deployed as usual. |
